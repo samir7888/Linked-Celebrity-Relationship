@@ -37,9 +37,7 @@ export function RelationshipViews({
         </div>
 
         <div className="flex items-center justify-between gap-3 sm:justify-end">
-          <span className="font-body text-xs font-semibold text-gold tabular-nums sm:hidden">
-            {relationships.length} recorded
-          </span>
+          
           <div className="inline-flex rounded-2xl border border-line/80 bg-white/70 p-1 shadow-xs backdrop-blur-md">
             <ViewTab
               active={view === "timeline"}

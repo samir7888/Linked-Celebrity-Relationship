@@ -125,11 +125,101 @@ export async function resolvePerson(query: string): Promise<{
   };
 }
 
-const RELATIONSHIP_PROPERTIES: { property: string; type: RelationshipType }[] =
-  [
-    { property: "P26", type: "spouse" },
-    { property: "P451", type: "partner" },
-  ];
+/** Helper to resolve entity names by QID when labels are missing. Note:
+ * SERVICE wikibase:label does NOT follow redirects — if a QID was merged
+ * into another item (common when duplicate Wikidata items get cleaned up),
+ * this silently returns the QID string itself as the "label" instead of
+ * erroring. resolveEntityNames() below rejects those QID-shaped fallbacks
+ * so callers know to fall back to resolveNamesViaWbGetEntities(), which
+ * does follow redirects. */
+async function resolveEntityNames(
+  qids: string[]
+): Promise<Map<string, string>> {
+  if (qids.length === 0) return new Map();
+
+  const values = qids.map((q) => `wd:${q}`).join(" ");
+  const query = `
+    SELECT ?entity ?entityLabel WHERE {
+      VALUES ?entity { ${values} }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    }
+  `;
+
+  const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(
+    query
+  )}&format=json`;
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        ...commonHeaders(),
+        Accept: "application/sparql-results+json",
+      },
+      next: { revalidate: 86400 },
+    });
+
+    if (!res.ok) return new Map();
+
+    const data = await res.json();
+    const nameMap = new Map<string, string>();
+
+    for (const row of data.results?.bindings ?? []) {
+      const qid = row.entity.value.split("/").pop();
+      const label = row.entityLabel?.value;
+      if (
+        qid &&
+        label &&
+        !label.startsWith("http://") &&
+        !/^Q\d+$/.test(label) // reject redirect fallback (label === the QID itself)
+      ) {
+        nameMap.set(qid, label);
+      }
+    }
+
+    return nameMap;
+  } catch {
+    return new Map();
+  }
+}
+
+/** Fallback name resolver for QIDs that SERVICE wikibase:label couldn't
+ * label (usually because the item was merged/redirected into another QID).
+ * wbgetentities transparently follows redirects, so a stale/merged ID still
+ * resolves to its current real label instead of printing the ID itself. */
+async function resolveNamesViaWbGetEntities(
+  qids: string[]
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (qids.length === 0) return map;
+
+  for (let i = 0; i < qids.length; i += 50) {
+    const chunk = qids.slice(i, i + 50);
+    const url = new URL(WIKIDATA_API);
+    url.searchParams.set("action", "wbgetentities");
+    url.searchParams.set("ids", chunk.join("|"));
+    url.searchParams.set("props", "labels");
+    url.searchParams.set("languages", "en");
+    url.searchParams.set("format", "json");
+    url.searchParams.set("origin", "*");
+
+    try {
+      const res = await fetch(url.toString(), {
+        headers: commonHeaders(),
+        next: { revalidate: 86400 },
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const requestedQid of chunk) {
+        const label = data.entities?.[requestedQid]?.labels?.en?.value;
+        if (label) map.set(requestedQid, label);
+      }
+    } catch {
+      // leave unresolved; caller keeps its existing fallback name
+    }
+  }
+
+  return map;
+}
 
 async function fetchRelatives(qid: string): Promise<string[]> {
   const sparql = `
@@ -147,7 +237,10 @@ async function fetchRelatives(qid: string): Promise<string[]> {
   )}&format=json`;
   try {
     const res = await fetch(url, {
-      headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
+      headers: {
+        ...commonHeaders(),
+        Accept: "application/sparql-results+json",
+      },
       next: { revalidate: 86400 },
     });
     if (!res.ok) return [];
@@ -198,7 +291,10 @@ async function fetchPartnerNetwork(
   )}&format=json`;
   try {
     const res = await fetch(url, {
-      headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
+      headers: {
+        ...commonHeaders(),
+        Accept: "application/sparql-results+json",
+      },
       next: { revalidate: 3600 },
     });
     if (!res.ok) return [];
@@ -208,7 +304,8 @@ async function fetchPartnerNetwork(
     for (const row of data.results?.bindings ?? []) {
       const hubQid: string = row.hub.value.split("/").pop();
       const otherQid: string = row.other.value.split("/").pop();
-      const key = hubQid < otherQid ? `${hubQid}:${otherQid}` : `${otherQid}:${hubQid}`;
+      const key =
+        hubQid < otherQid ? `${hubQid}:${otherQid}` : `${otherQid}:${hubQid}`;
       if (seen.has(key)) continue;
       seen.add(key);
       links.push({
@@ -263,9 +360,12 @@ export async function fetchPersonRecord(
     sparql
   )}&format=json`;
 
-  const [res, relatives, humanInfo, partnerNetwork] = await Promise.all([
+  const [res, relatives, humanInfo, partnerNetworkResult] = await Promise.all([
     fetch(url, {
-      headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
+      headers: {
+        ...commonHeaders(),
+        Accept: "application/sparql-results+json",
+      },
       next: { revalidate: 3600 },
     }).catch(() => null),
     fetchRelatives(resolved.qid),
@@ -273,16 +373,50 @@ export async function fetchPersonRecord(
     fetchPartnerNetwork(resolved.qid),
   ]);
 
+  let partnerNetwork = partnerNetworkResult;
+
   const relationships: RelationshipEdge[] = [];
+  const missingNames = new Set<string>();
+
   if (res && res.ok) {
     const data = await res.json();
     for (const row of data.results.bindings) {
-      const partnerQid: string = row.partner.value.split("/").pop();
+      const partnerUrl: string = row.partner.value;
+      const partnerLabel = row.partnerLabel?.value;
       const start = row.start?.value ?? null;
       const end = row.end?.value ?? null;
+
+      // Skip blank nodes (genid URLs) - these are anonymous entities without proper QIDs
+      if (partnerUrl.includes("/.well-known/genid/")) {
+        continue; // Skip this relationship entirely
+      }
+
+      const partnerQid: string | undefined = partnerUrl.split("/").pop();
+
+      // Check if it's a valid QID format (starts with Q followed by numbers)
+      if (!partnerQid || !partnerQid.match(/^Q\d+$/)) {
+        continue; // Skip invalid QIDs
+      }
+
+      // Check if we have a proper name, or if the label is missing/is a
+      // QID (the SPARQL label service prints the QID itself when the item
+      // is a redirect/merge target it can't label directly).
+      let name = "Unknown";
+      if (
+        partnerLabel &&
+        !partnerLabel.startsWith("http://") &&
+        !partnerLabel.match(/^Q\d+$/) && // reject QID-shaped fallback labels
+        partnerLabel.trim()
+      ) {
+        name = partnerLabel;
+      } else {
+        // Mark for name resolution - either missing label or label is just a QID
+        missingNames.add(partnerQid);
+      }
+
       relationships.push({
         partnerQid,
-        name: row.partnerLabel?.value ?? "Unknown",
+        name,
         type: row.type.value as RelationshipType,
         start,
         end,
@@ -296,11 +430,48 @@ export async function fetchPersonRecord(
     }
   }
 
+  // Resolve missing/QID-fallback names. First try the label service again
+  // via a clean batch call, then fall back to wbgetentities (which follows
+  // redirects) for anything still unresolved — this is what fixes names
+  // like "Q34436" showing up instead of "Scarlett Johansson".
+  if (missingNames.size > 0) {
+    const nameMap = await resolveEntityNames(Array.from(missingNames));
+
+    const stillMissing = Array.from(missingNames).filter(
+      (q) => !nameMap.has(q)
+    );
+    if (stillMissing.length > 0) {
+      const fallbackMap = await resolveNamesViaWbGetEntities(stillMissing);
+      for (const [qid, label] of fallbackMap) nameMap.set(qid, label);
+    }
+
+    for (const rel of relationships) {
+      if (
+        rel.partnerQid &&
+        (rel.name === "Unknown" || /^Q\d+$/.test(rel.name))
+      ) {
+        const resolvedName = nameMap.get(rel.partnerQid);
+        if (resolvedName) {
+          rel.name = resolvedName;
+        }
+      }
+    }
+  }
+
+  // If a partner's name still couldn't be resolved after both attempts, it's
+  // a dead/deleted Wikidata reference (the SPARQL endpoint has a stale
+  // record for an item that's since been merged/removed on the live site,
+  // with no redirect left behind) — not something we can resolve further.
+  // Drop it rather than show "Unknown" or a raw QID to the user.
+  const resolvedRelationships = relationships.filter(
+    (rel) => rel.name !== "Unknown" && !/^Q\d+$/.test(rel.name)
+  );
+
   // De-duplicate: the same partner can appear once as "partner" and again as
   // "spouse" (dated, then married). Keep the entry with the earliest start
   // date and merge the marriage flag in as the more specific type.
   const byPartner = new Map<string, RelationshipEdge>();
-  for (const rel of relationships) {
+  for (const rel of resolvedRelationships) {
     if (!rel.partnerQid) continue; // Skip if no QID (shouldn't happen for wikidata)
     const existing = byPartner.get(rel.partnerQid);
     if (!existing) {
@@ -313,6 +484,8 @@ export async function fetchPersonRecord(
         : rel;
     byPartner.set(rel.partnerQid, {
       ...earliest,
+      // Prefer whichever of the two entries has a resolved (non-QID) name.
+      name: /^Q\d+$/.test(earliest.name) ? rel.name : earliest.name,
       type:
         existing.type === "spouse" || rel.type === "spouse"
           ? "spouse"
@@ -330,6 +503,49 @@ export async function fetchPersonRecord(
     return a.start.localeCompare(b.start);
   });
 
+  // Wikidata doesn't reliably record an end date for every relationship
+  // that's actually over — a lot of past marriages simply have no P582
+  // qualifier logged. Relying on "no end date" alone to mean "ongoing"
+  // makes old relationships look current. Fix: only the chronologically
+  // *last* relationship can be treated as ongoing when its end is missing;
+  // any earlier one is necessarily over once a later one has started.
+  const finalRelationships = dedupedRelationships.map((rel, idx) => {
+    const isMostRecent = idx === dedupedRelationships.length - 1;
+    if (!rel.end && !isMostRecent) {
+      return { ...rel, ongoing: false };
+    }
+    return rel;
+  });
+
+  // Same redirect issue can show up in the partner-network graph (e.g. a
+  // "hub" person whose QID was merged) — resolve any QID-shaped names there too.
+  const networkUnresolved = new Set<string>();
+  for (const link of partnerNetwork) {
+    if (/^Q\d+$/.test(link.hubName)) networkUnresolved.add(link.hubQid);
+    if (/^Q\d+$/.test(link.otherName)) networkUnresolved.add(link.otherQid);
+  }
+  if (networkUnresolved.size > 0) {
+    const fallbackMap = await resolveNamesViaWbGetEntities(
+      Array.from(networkUnresolved)
+    );
+    partnerNetwork = partnerNetwork.map((link) => ({
+      ...link,
+      hubName: fallbackMap.get(link.hubQid) ?? link.hubName,
+      otherName: fallbackMap.get(link.otherQid) ?? link.otherName,
+    }));
+  }
+
+  // Same reasoning as resolvedRelationships above: if a hub or other person
+  // in the network graph still has no real name, it's a dead reference —
+  // drop the link instead of rendering "Unknown" or a raw QID.
+  partnerNetwork = partnerNetwork.filter(
+    (link) =>
+      link.hubName !== "Unknown" &&
+      !/^Q\d+$/.test(link.hubName) &&
+      link.otherName !== "Unknown" &&
+      !/^Q\d+$/.test(link.otherName)
+  );
+
   const info = humanInfo.get(resolved.qid);
 
   return {
@@ -338,7 +554,7 @@ export async function fetchPersonRecord(
     description: resolved.description,
     image: info?.image ?? null,
     wikipediaUrl: info?.wikipediaUrl ?? null,
-    relationships: dedupedRelationships,
+    relationships: finalRelationships,
     relatives,
     partnerNetwork,
   };

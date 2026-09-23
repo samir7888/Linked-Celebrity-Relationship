@@ -37,6 +37,7 @@ const getPerson = cache(async (slug: string) => {
       console.log("[PAGE] No Wikidata record found for:", name);
       return null;
     }
+    console.log("record:", record);
 
     console.log("[PAGE] Wikidata record found:", record.name, "— now calling LLM...");
 
