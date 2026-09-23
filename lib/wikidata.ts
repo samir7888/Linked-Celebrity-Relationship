@@ -1,4 +1,9 @@
-import type { PersonRecord, RelationshipEdge, RelationshipType } from "./types";
+import type {
+  PartnerNetworkLink,
+  PersonRecord,
+  RelationshipEdge,
+  RelationshipType,
+} from "./types";
 
 const WIKIDATA_API = "https://www.wikidata.org/w/api.php";
 const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
@@ -158,6 +163,76 @@ async function fetchRelatives(qid: string): Promise<string[]> {
   }
 }
 
+/** One extra hop from each of the subject's partners: other spouses/partners
+ * of those people. Those "others" share an ex (the hub) with the subject. */
+async function fetchPartnerNetwork(
+  subjectQid: string
+): Promise<PartnerNetworkLink[]> {
+  const sparql = `
+    SELECT ?hub ?hubLabel ?hubImage ?other ?otherLabel ?otherImage ?type ?start ?end WHERE {
+      { wd:${subjectQid} wdt:P26 ?hub }
+      UNION
+      { wd:${subjectQid} wdt:P451 ?hub }
+      {
+        ?hub p:P26 ?stmt .
+        ?stmt ps:P26 ?other .
+        BIND("spouse" AS ?type)
+      }
+      UNION
+      {
+        ?hub p:P451 ?stmt .
+        ?stmt ps:P451 ?other .
+        BIND("partner" AS ?type)
+      }
+      FILTER(?other != wd:${subjectQid})
+      OPTIONAL { ?stmt pq:P580 ?start. }
+      OPTIONAL { ?stmt pq:P582 ?end. }
+      OPTIONAL { ?hub wdt:P18 ?hubImage. }
+      OPTIONAL { ?other wdt:P18 ?otherImage. }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    }
+    LIMIT 120
+  `;
+  const url = `${WIKIDATA_SPARQL}?query=${encodeURIComponent(
+    sparql
+  )}&format=json`;
+  try {
+    const res = await fetch(url, {
+      headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
+      next: { revalidate: 3600 },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const links: PartnerNetworkLink[] = [];
+    const seen = new Set<string>();
+    for (const row of data.results?.bindings ?? []) {
+      const hubQid: string = row.hub.value.split("/").pop();
+      const otherQid: string = row.other.value.split("/").pop();
+      const key = hubQid < otherQid ? `${hubQid}:${otherQid}` : `${otherQid}:${hubQid}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({
+        hubQid,
+        hubName: row.hubLabel?.value ?? "Unknown",
+        hubImage: row.hubImage?.value
+          ? toCommonsFilePath(row.hubImage.value)
+          : null,
+        otherQid,
+        otherName: row.otherLabel?.value ?? "Unknown",
+        otherImage: row.otherImage?.value
+          ? toCommonsFilePath(row.otherImage.value)
+          : null,
+        type: row.type.value as RelationshipType,
+        start: row.start?.value ?? null,
+        end: row.end?.value ?? null,
+      });
+    }
+    return links;
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchPersonRecord(
   query: string
 ): Promise<PersonRecord | null> {
@@ -188,13 +263,14 @@ export async function fetchPersonRecord(
     sparql
   )}&format=json`;
 
-  const [res, relatives, humanInfo] = await Promise.all([
+  const [res, relatives, humanInfo, partnerNetwork] = await Promise.all([
     fetch(url, {
       headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
       next: { revalidate: 3600 },
     }).catch(() => null),
     fetchRelatives(resolved.qid),
     filterHumans([resolved.qid]),
+    fetchPartnerNetwork(resolved.qid),
   ]);
 
   const relationships: RelationshipEdge[] = [];
@@ -264,5 +340,6 @@ export async function fetchPersonRecord(
     wikipediaUrl: info?.wikipediaUrl ?? null,
     relationships: dedupedRelationships,
     relatives,
+    partnerNetwork,
   };
 }

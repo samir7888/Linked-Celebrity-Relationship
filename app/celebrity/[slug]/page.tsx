@@ -12,8 +12,9 @@ import {
 } from "lucide-react";
 import { computeStats } from "@/lib/stats";
 import { slugify, unslugify } from "@/lib/utils";
-import { Timeline } from "@/components/Timeline";
 import { StatLedger } from "@/components/StatLedger";
+import { RelationshipViews } from "@/components/RelationshipViews";
+import { buildConstellationGraph } from "@/lib/constellation";
 import { SearchForm } from "@/components/SearchForm";
 import { ShareButton } from "@/components/ShareButton";
 import { fetchPersonRecord } from "@/lib/wikidata";
@@ -98,6 +99,11 @@ export default async function CelebrityPage({ params }: Props) {
       .filter((id): id is string => id !== null)
   );
 
+  const constellation = buildConstellationGraph(
+    person,
+    person.partnerNetwork ?? []
+  );
+
   const otherCelebrities = TRENDING_NAMES.filter(
     (n) => slugify(n) !== params.slug
   ).slice(0, 8);
@@ -170,7 +176,7 @@ export default async function CelebrityPage({ params }: Props) {
       </header>
 
       {/* Main Content Container */}
-      <div className="mx-auto max-w-3xl px-3 pt-4 sm:px-6 sm:pt-12">
+      <div className="mx-auto max-w-6xl px-3 pt-4 sm:px-6 sm:pt-12">
         {/* Editorial Profile Hero Banner */}
         <section className="relative overflow-hidden rounded-2xl border border-line/80 bg-gradient-to-b from-white/90 via-white/70 to-paper p-4 shadow-[0_8px_30px_-10px_rgba(27,26,34,0.06)] backdrop-blur-sm sm:rounded-3xl sm:p-8">
           <div className="flex flex-col items-center gap-4 text-center sm:flex-row sm:items-start sm:gap-6 sm:text-left">
@@ -243,27 +249,12 @@ export default async function CelebrityPage({ params }: Props) {
           <StatLedger stats={stats} />
         </section>
 
-        {/* Timeline Section */}
-        <section className="mt-12 sm:mt-16">
-          <div className="mb-6 flex flex-wrap items-baseline justify-between gap-2 border-b border-line/80 pb-3">
-            <div>
-              <h2 className="font-display text-2xl italic tracking-tight text-ink sm:text-3xl">
-                Relationship Timeline
-              </h2>
-              <p className="mt-0.5 font-body text-xs text-ink-soft/75 sm:text-sm">
-                Chronological record of marriages, partnerships, and reported dating history.
-              </p>
-            </div>
-            <span className="font-body text-xs font-semibold text-gold tabular-nums">
-              {person.relationships.length} recorded
-            </span>
-          </div>
-
-          <Timeline
-            relationships={person.relationships}
-            overlapPairs={overlapPartnerIds}
-          />
-        </section>
+        <RelationshipViews
+          relationships={person.relationships}
+          overlapPairs={overlapPartnerIds}
+          constellation={constellation}
+          subjectName={person.name}
+        />
 
         {/* Explore Other Celebrities */}
         <section className="mt-16 rounded-3xl border border-line/80 bg-white/60 p-6 backdrop-blur-sm sm:p-8">

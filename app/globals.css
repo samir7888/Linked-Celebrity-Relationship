@@ -53,3 +53,58 @@ body {
   background-position: 0 100%;
   background-size: 100% 2px;
 }
+
+.constellation-sky {
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 42%, rgba(184, 148, 79, 0.16), transparent 58%),
+    radial-gradient(ellipse 45% 40% at 12% 88%, rgba(140, 31, 59, 0.22), transparent 52%),
+    radial-gradient(ellipse 40% 35% at 92% 12%, rgba(92, 107, 87, 0.16), transparent 50%),
+    #16141c;
+  cursor: grab;
+}
+
+.constellation-sky:active {
+  cursor: grabbing;
+}
+
+.constellation-star {
+  animation: constellation-twinkle 3.6s ease-in-out infinite;
+}
+
+.constellation-pulse {
+  animation: constellation-pulse 3.2s ease-out infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+
+@keyframes constellation-twinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes constellation-pulse {
+  0% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  70% {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .constellation-star,
+  .constellation-pulse {
+    animation: none;
+  }
+}
