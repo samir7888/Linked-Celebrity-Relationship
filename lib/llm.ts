@@ -91,11 +91,12 @@ Return the JSON now.`,
           },
         ],
       }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!res.ok) {
-      console.log("[LLM] API error:", res.status, res.statusText);
+      const errText = await res.text().catch(() => "");
+      console.log("[LLM] API error:", res.status, res.statusText, errText.slice(0, 200));
       return [];
     }
     const data = await res.json();

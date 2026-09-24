@@ -41,9 +41,10 @@ async function searchWikidataCandidates(
   const res = await fetch(url.toString(), {
     headers: commonHeaders(),
     next: { revalidate: 86400 },
-  });
-  if (!res.ok) return [];
-  const data = await res.json();
+    signal: AbortSignal.timeout(6000),
+  }).catch(() => null);
+  if (!res || !res.ok) return [];
+  const data = await res.json().catch(() => ({}));
   return (data.search ?? []).map((s: any) => ({
     id: s.id,
     label: s.label,
@@ -78,13 +79,14 @@ async function filterHumans(qids: string[]) {
   const res = await fetch(url, {
     headers: { ...commonHeaders(), Accept: "application/sparql-results+json" },
     next: { revalidate: 86400 },
-  });
+    signal: AbortSignal.timeout(6000),
+  }).catch(() => null);
   const map = new Map<
     string,
     { image: string | null; wikipediaUrl: string | null }
   >();
-  if (!res.ok) return map;
-  const data = await res.json();
+  if (!res || !res.ok) return map;
+  const data = await res.json().catch(() => ({ results: { bindings: [] } }));
   for (const row of data.results.bindings) {
     const qid = row.person.value.split("/").pop();
     map.set(qid, {
@@ -156,6 +158,7 @@ async function resolveEntityNames(
         Accept: "application/sparql-results+json",
       },
       next: { revalidate: 86400 },
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!res.ok) return new Map();
@@ -206,6 +209,7 @@ async function resolveNamesViaWbGetEntities(
       const res = await fetch(url.toString(), {
         headers: commonHeaders(),
         next: { revalidate: 86400 },
+        signal: AbortSignal.timeout(6000),
       });
       if (!res.ok) continue;
       const data = await res.json();
@@ -242,6 +246,7 @@ async function fetchRelatives(qid: string): Promise<string[]> {
         Accept: "application/sparql-results+json",
       },
       next: { revalidate: 86400 },
+      signal: AbortSignal.timeout(6000),
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -296,6 +301,7 @@ async function fetchPartnerNetwork(
         Accept: "application/sparql-results+json",
       },
       next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(6000),
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -367,6 +373,7 @@ export async function fetchPersonRecord(
         Accept: "application/sparql-results+json",
       },
       next: { revalidate: 3600 },
+      signal: AbortSignal.timeout(6500),
     }).catch(() => null),
     fetchRelatives(resolved.qid),
     filterHumans([resolved.qid]),

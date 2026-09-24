@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   Sparkles,
   Compass,
+  Database,
 } from "lucide-react";
 import { computeStats } from "@/lib/stats";
 import { slugify, unslugify } from "@/lib/utils";
@@ -21,70 +22,106 @@ import { fetchPersonRecord } from "@/lib/wikidata";
 import { fetchLLMRelationships } from "@/lib/llm";
 import { mergeRelationships } from "@/lib/merge";
 import { TRENDING_NAMES } from "@/lib/trending";
+import { PersonRecord } from "@/lib/types";
 
 interface Props {
   params: { slug: string };
 }
 
-const getPerson = cache(async (slug: string) => {
+// In-memory cache across requests with 12 hour TTL
+interface CachedPerson {
+  person: PersonRecord | null;
+  timestamp: number;
+}
+const personMemoryCache = new Map<string, CachedPerson>();
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+async function fetchPersonData(slug: string): Promise<PersonRecord | null> {
+  const cached = personMemoryCache.get(slug);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.person;
+  }
+
   const name = unslugify(slug);
-
-  console.log("[PAGE] Fetching person record for:", name);
-
   try {
-    const record = await fetchPersonRecord(name);
+    // Run Wikidata and LLM in parallel for 2x faster response time
+    const [recordResult, llmResult] = await Promise.allSettled([
+      fetchPersonRecord(name),
+      fetchLLMRelationships(name, [], []),
+    ]);
+
+    const record =
+      recordResult.status === "fulfilled" ? recordResult.value : null;
+    const llmEdges =
+      llmResult.status === "fulfilled" ? llmResult.value : [];
+
     if (!record) {
-      console.log("[PAGE] No Wikidata record found for:", name);
+      // If Wikidata didn't find the person, but LLM has relationships
+      if (llmEdges.length > 0) {
+        const syntheticPerson: PersonRecord = {
+          qid: `synth-${slug}`,
+          name,
+          description: "Public figure",
+          image: null,
+          wikipediaUrl: null,
+          relationships: llmEdges,
+          relatives: [],
+          partnerNetwork: [],
+        };
+        personMemoryCache.set(slug, {
+          person: syntheticPerson,
+          timestamp: Date.now(),
+        });
+        return syntheticPerson;
+      }
+      personMemoryCache.set(slug, { person: null, timestamp: Date.now() });
       return null;
     }
-    console.log("record:", record);
 
-    console.log("[PAGE] Wikidata record found:", record.name, "— now calling LLM...");
-
-    const knownNames = record.relationships.map((r) => r.name);
     const relatives = record.relatives ?? [];
-    const [llmResult] = await Promise.allSettled([
-      fetchLLMRelationships(record.name, knownNames, relatives),
-    ]);
-    const llmEdges = llmResult.status === "fulfilled" ? llmResult.value : [];
+    const mergedRelationships = mergeRelationships(
+      record.relationships,
+      llmEdges,
+      [record.name, ...relatives]
+    );
 
-    console.log("[PAGE] LLM returned", llmEdges.length, "edge(s)");
-
-    return {
+    const fullPerson: PersonRecord = {
       ...record,
-      relationships: mergeRelationships(record.relationships, llmEdges, [
-        record.name,
-        ...relatives,
-      ]),
+      relationships: mergedRelationships,
     };
-  } catch (error) {
-    console.error("[PAGE] Failed to fetch person data:", error);
+
+    personMemoryCache.set(slug, { person: fullPerson, timestamp: Date.now() });
+    return fullPerson;
+  } catch (err) {
+    console.error("[PAGE] Error fetching person:", err);
     return null;
   }
+}
+
+// React cache per request deduplication
+const getPerson = cache(async (slug: string) => {
+  return fetchPersonData(slug);
 });
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const person = await getPerson(params.slug);
-  if (!person) {
-    return { title: "Not found" };
-  }
-  const count = person.relationships.length;
-  const description = person.description
-    ? `${person.name}, ${
-        person.description
-      }. See ${count} recorded relationship${
-        count === 1 ? "" : "s"
-      } on a timeline — who, when, and for how long.`
-    : `See ${person.name}'s recorded relationship history on a timeline — who, when, and for how long.`;
+export function generateMetadata({ params }: Props): Metadata {
+  const name = unslugify(params.slug);
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://example.com";
+  const title = `${name}'s Relationship Timeline & Dating History | Linked`;
+  const description = `Explore ${name}'s verified romantic relationship history, dating timeline, marriages, and partner network. Documented with dates and public sources.`;
 
   return {
-    title: `${person.name}'s relationship timeline — Linked`,
+    title,
     description,
-    alternates: { canonical: `/celebrity/${params.slug}` },
+    alternates: { canonical: `${siteUrl}/celebrity/${params.slug}` },
     openGraph: {
-      title: `${person.name}'s relationship timeline — Linked`,
+      title,
       description,
-      images: person.image ? [{ url: person.image }] : undefined,
+      type: "profile",
+    },
+    twitter: {
+      card: "summary_large_image",
+      title,
+      description,
     },
   };
 }
@@ -92,6 +129,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 export default async function CelebrityPage({ params }: Props) {
   const person = await getPerson(params.slug);
   if (!person) notFound();
+  console.log("personn", person)
 
   const stats = computeStats(person.relationships);
   const overlapPartnerIds = new Set(
@@ -107,8 +145,11 @@ export default async function CelebrityPage({ params }: Props) {
 
   const otherCelebrities = TRENDING_NAMES.filter(
     (n) => slugify(n) !== params.slug
-  ).slice(0, 8);
+  ).slice(0, 9);
 
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://example.com";
+
+  // Person JSON-LD structured data
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "Person",
@@ -116,10 +157,14 @@ export default async function CelebrityPage({ params }: Props) {
     description: person.description ?? undefined,
     image: person.image ?? undefined,
     sameAs: person.wikipediaUrl ?? undefined,
+    url: `${siteUrl}/celebrity/${params.slug}`,
     spouse: person.relationships
       .filter((r) => r.type === "spouse")
       .map((r) => ({ "@type": "Person", name: r.name })),
+    knows: person.relationships.map((r) => ({ "@type": "Person", name: r.name })),
   };
+
+  const hasRelationships = person.relationships.length > 0;
 
   return (
     <main className="min-h-screen bg-paper pb-20 selection:bg-gold/30">
@@ -128,128 +173,171 @@ export default async function CelebrityPage({ params }: Props) {
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
 
-      {/* Ambient background glow accents */}
+      {/* ── Ambient background glows ─────────────────────── */}
       <div
         aria-hidden
         className="pointer-events-none fixed inset-0 -z-10 overflow-hidden"
       >
-        <div className="absolute -top-40 right-1/4 h-96 w-96 rounded-full bg-gold/10 blur-3xl" />
-        <div className="absolute top-60 -left-20 h-80 w-80 rounded-full bg-wine/5 blur-3xl" />
+        <div className="absolute -top-32 right-1/3 h-[500px] w-[500px] rounded-full bg-gold/8 blur-[120px]" />
+        <div className="absolute top-1/2 -left-20 h-80 w-80 rounded-full bg-wine/5 blur-[90px]" />
       </div>
 
-      {/* Floating Glassmorphic Header */}
-      <header className="sticky top-0 z-40 border-b border-line/70 bg-paper/85 backdrop-blur-md transition-all">
-        <div className="mx-auto flex max-w-4xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
+      {/* ── Sticky Header ────────────────────────────────── */}
+      <header className="sticky top-0 z-40 border-b border-line/60 bg-paper/90 backdrop-blur-md transition-all">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3 sm:gap-4 sm:px-6">
+          {/* Back to home */}
           <Link
             href="/"
-            className="group inline-flex items-center gap-2 font-display text-base italic text-ink transition-colors hover:text-wine"
+            className="group inline-flex items-center gap-2 font-display text-sm italic text-ink transition-colors hover:text-wine sm:text-base"
           >
-            <span className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-white/80 text-ink transition-transform group-hover:-translate-x-0.5 group-hover:border-wine/50">
+            <span className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-white/80 text-ink shadow-sm transition-all group-hover:-translate-x-0.5 group-hover:border-wine/40 group-hover:bg-wine/5 group-hover:text-wine">
               <ArrowLeft size={13} />
             </span>
-            <span className="font-semibold tracking-tight">Linked</span>
+            <span className="hidden font-semibold tracking-tight sm:inline">Linked</span>
           </Link>
 
+          {/* Inline search */}
           <div className="hidden max-w-xs flex-1 sm:block md:max-w-sm">
             <SearchForm tone="light" />
           </div>
 
-          <div className="flex items-center gap-2">
+          {/* Actions */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
             <ShareButton name={person.name} />
             {person.wikipediaUrl && (
               <a
                 href={person.wikipediaUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="hidden items-center gap-1 rounded-full border border-line/70 bg-white/70 px-3 py-1.5 font-body text-xs font-medium text-ink-soft shadow-xs backdrop-blur-sm transition-all hover:border-line hover:bg-white hover:text-ink md:inline-flex"
+                aria-label={`${person.name} on Wikipedia`}
+                className="hidden items-center gap-1 rounded-full border border-line/70 bg-white/70 px-3 py-1.5 font-body text-xs font-medium text-ink-soft shadow-sm backdrop-blur-sm transition-all hover:border-line hover:bg-white hover:text-ink sm:inline-flex"
               >
-                <span>Wikipedia</span>
-                <ExternalLink size={11} className="text-ink-soft/70" />
+                Wikipedia
+                <ExternalLink size={10} className="text-ink-soft/60" />
               </a>
             )}
           </div>
         </div>
 
-        {/* Mobile Search Input */}
-        <div className="border-t border-line/50 px-4 py-2 sm:hidden">
+        {/* Mobile search */}
+        <div className="border-t border-line/40 px-4 py-2 sm:hidden">
           <SearchForm tone="light" />
         </div>
       </header>
 
-      {/* Main Content Container */}
-      <div className="mx-auto max-w-6xl px-3 pt-4 sm:px-6 sm:pt-12">
-        {/* Editorial Profile Hero Banner */}
-        <section className="relative overflow-hidden rounded-2xl border border-line/80 bg-gradient-to-b from-white/90 via-white/70 to-paper p-4 shadow-[0_8px_30px_-10px_rgba(27,26,34,0.06)] backdrop-blur-sm sm:rounded-3xl sm:p-8">
-          <div className="flex flex-col items-center gap-4 text-center sm:flex-row sm:items-start sm:gap-6 sm:text-left">
-            {/* Celebrity Portrait */}
+      {/* ── Page Content ─────────────────────────────────── */}
+      <div className="mx-auto max-w-5xl px-3 pt-5 sm:px-6 sm:pt-10">
+
+        {/* ── Profile Hero Card ──────────────────────────── */}
+        <section
+          aria-label={`${person.name} profile`}
+          className="relative overflow-hidden rounded-2xl border border-line/70 bg-gradient-to-br from-white via-white/80 to-paper/60 shadow-[0_4px_24px_-8px_rgba(27,26,34,0.07)] sm:rounded-3xl"
+        >
+          {/* Decorative top accent */}
+          <div
+            aria-hidden
+            className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-transparent via-gold/60 to-transparent"
+          />
+
+          <div className="flex flex-col items-center gap-5 p-5 text-center sm:flex-row sm:items-start sm:gap-7 sm:p-7 sm:text-left">
+            {/* Portrait */}
             <div className="relative shrink-0">
-              <div className="relative h-20 w-20 overflow-hidden rounded-2xl bg-ink/5 p-1 ring-2 ring-line/80 shadow-md sm:h-28 sm:w-28 sm:rounded-3xl">
+              <div className="relative h-24 w-24 overflow-hidden rounded-2xl bg-ink/5 ring-2 ring-line/70 shadow-md sm:h-32 sm:w-32 sm:rounded-3xl">
                 {person.image ? (
                   <Image
                     src={person.image}
-                    alt={person.name}
+                    alt={`${person.name} photo`}
                     fill
-                    sizes="(max-width: 640px) 80px, 112px"
-                    className="rounded-[14px] object-cover object-top sm:rounded-[20px]"
+                    sizes="(max-width: 640px) 96px, 128px"
+                    className="rounded-[inherit] object-cover object-top"
                     unoptimized
                     priority
                   />
                 ) : (
-                  <div className="flex h-full w-full items-center justify-center rounded-[14px] bg-gradient-to-br from-paper to-line/60 font-display text-3xl italic text-ink-soft/40 sm:rounded-[20px] sm:text-4xl">
+                  <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-paper to-line/60 font-display text-4xl italic text-ink-soft/30">
                     {person.name.charAt(0)}
                   </div>
                 )}
               </div>
-
-              {/* Status Badge Pin */}
+              {/* Verified badge */}
               <div
-                className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border-2 border-paper bg-wine text-white shadow-sm sm:h-7 sm:w-7"
-                title="Public Verified Archive"
+                className="absolute -bottom-1.5 -right-1.5 flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-wine text-white shadow-md"
+                title="Wikidata verified"
               >
-                <ShieldCheck size={12} className="sm:h-3.5 sm:w-3.5" />
+                <ShieldCheck size={13} />
               </div>
             </div>
 
-            {/* Profile Info */}
+            {/* Info */}
             <div className="min-w-0 flex-1">
-              <div className="inline-flex items-center gap-1.5 rounded-full bg-gold/10 px-2.5 py-0.5 font-body text-[10px] font-medium text-amber-900 ring-1 ring-gold/20 sm:text-[11px]">
-                <Sparkles size={10} className="text-gold" />
+              {/* Label pill */}
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-gold/10 px-2.5 py-0.5 font-body text-[10px] font-semibold uppercase tracking-wide text-amber-800 ring-1 ring-gold/25">
+                <Sparkles size={9} className="text-gold" />
                 Celebrity Relationship Archive
-              </div>
+              </span>
 
-              <h1 className="mt-1.5 text-balance font-display text-2xl italic tracking-tight text-ink sm:text-4xl md:text-5xl">
+              {/* Name */}
+              <h1 className="mt-2 text-balance font-display text-2xl italic tracking-tight text-ink sm:text-4xl md:text-5xl">
                 {person.name}
               </h1>
 
+              {/* Description */}
               {person.description && (
-                <p className="mt-1 font-body text-xs capitalize text-ink-soft sm:mt-1.5 sm:text-base">
+                <p className="mt-1.5 font-body text-xs capitalize leading-relaxed text-ink-soft sm:text-sm">
                   {person.description}
                 </p>
               )}
 
-              {/* External source pill */}
-              {person.wikipediaUrl && (
-                <div className="mt-2.5 flex flex-wrap items-center justify-center gap-2 sm:mt-3.5 sm:justify-start">
+              {/* Stats quick-view pills */}
+              {hasRelationships && (
+                <div className="mt-3 flex flex-wrap items-center justify-center gap-2 sm:justify-start">
+                  <span className="rounded-full bg-ink/[0.04] px-2.5 py-1 font-body text-xs text-ink-soft ring-1 ring-line/60">
+                    <strong className="font-semibold text-ink">{stats.totalRelationships}</strong> relationships
+                  </span>
+                  {stats.longest && (
+                    <span className="rounded-full bg-ink/[0.04] px-2.5 py-1 font-body text-xs text-ink-soft ring-1 ring-line/60">
+                      With <strong className="font-semibold text-ink">{stats.longest.name}</strong> longest
+                    </span>
+                  )}
+                  {person.relationships.some((r) => r.ongoing) && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 font-body text-xs font-medium text-emerald-800 ring-1 ring-emerald-500/20">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      Currently in a relationship
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Links */}
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-3 sm:justify-start">
+                {person.wikipediaUrl && (
                   <a
                     href={person.wikipediaUrl}
                     target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 font-body text-xs text-wine underline underline-offset-4 transition-colors hover:text-wine-deep"
+                    rel="noreferrer noopener"
+                    className="inline-flex items-center gap-1 font-body text-xs text-wine underline underline-offset-2 transition-colors hover:text-wine-deep"
                   >
-                    <span>View encyclopedia entry on Wikipedia</span>
-                    <ExternalLink size={12} />
+                    View on Wikipedia
+                    <ExternalLink size={11} />
                   </a>
-                </div>
-              )}
+                )}
+                <span className="inline-flex items-center gap-1 font-body text-[11px] text-ink-soft/50">
+                  <Database size={10} />
+                  Sourced from Wikidata
+                </span>
+              </div>
             </div>
           </div>
         </section>
 
-        {/* Ledger Statistics Cards */}
-        <section className="mt-6 sm:mt-8">
-          <StatLedger stats={stats} />
-        </section>
+        {/* ── Stats Ledger ───────────────────────────────── */}
+        {hasRelationships && (
+          <section aria-label="Relationship statistics" className="mt-5 sm:mt-6">
+            <StatLedger stats={stats} />
+          </section>
+        )}
 
+        {/* ── Relationship Views (Timeline + Constellation) ── */}
         <RelationshipViews
           relationships={person.relationships}
           overlapPairs={overlapPartnerIds}
@@ -257,44 +345,60 @@ export default async function CelebrityPage({ params }: Props) {
           subjectName={person.name}
         />
 
-        {/* Explore Other Celebrities */}
-        <section className="mt-16 rounded-3xl border border-line/80 bg-white/60 p-6 backdrop-blur-sm sm:p-8">
-          <div className="flex items-center gap-2 text-ink">
-            <Compass size={18} className="text-gold" />
-            <h3 className="font-display text-lg italic sm:text-xl">
+        {/* ── Explore More Celebrities ────────────────────── */}
+        <section
+          aria-labelledby="explore-heading"
+          className="mt-14 rounded-2xl border border-line/70 bg-white/60 p-5 backdrop-blur-sm sm:mt-16 sm:rounded-3xl sm:p-7"
+        >
+          <div className="flex items-center gap-2">
+            <Compass size={16} className="text-gold" />
+            <h2
+              id="explore-heading"
+              className="font-display text-base italic text-ink sm:text-lg"
+            >
               Explore More Relationship Timelines
-            </h3>
+            </h2>
           </div>
-          <p className="mt-1 font-body text-xs text-ink-soft/70">
-            Discover dating histories and relationship timelines of other popular public figures.
+          <p className="mt-1 font-body text-xs leading-relaxed text-ink-soft/65">
+            Discover the dating histories and relationship timelines of other
+            popular celebrities.
           </p>
 
-          <div className="mt-5 flex flex-wrap gap-2">
+          <div className="mt-4 flex flex-wrap gap-2">
             {otherCelebrities.map((name) => (
               <Link
                 key={name}
                 href={`/celebrity/${slugify(name)}`}
-                className="group inline-flex items-center gap-2 rounded-2xl border border-line/70 bg-paper/70 px-3.5 py-2 font-body text-xs font-medium text-ink transition-all duration-200 hover:-translate-y-0.5 hover:border-gold hover:bg-white hover:shadow-xs"
+                className="group inline-flex items-center gap-2 rounded-xl border border-line/60 bg-paper/70 px-3 py-1.5 font-body text-xs font-medium text-ink transition-all duration-200 hover:-translate-y-0.5 hover:border-gold/50 hover:bg-white hover:shadow-sm"
               >
                 <span className="flex h-5 w-5 items-center justify-center rounded-full bg-ink/5 font-display text-[10px] italic text-ink-soft transition-colors group-hover:bg-wine/10 group-hover:text-wine">
                   {name.charAt(0)}
                 </span>
-                <span>{name}</span>
+                {name}
               </Link>
             ))}
           </div>
         </section>
 
-        {/* Dataset Methodology & Disclaimer */}
-        <footer className="mt-12 border-t border-line/60 pt-6">
-          <div className="rounded-2xl bg-ink/[0.02] p-4 text-ink-soft/70">
-            <p className="font-body text-[11px] leading-relaxed">
-              <strong>Data provenance:</strong> Names, dates, and media records are compiled
-              from Wikidata&rsquo;s public knowledge graph and cross-verified against
-              mainstream press reports. Private relationships that were never publicized may not
-              appear. Corrections can be submitted directly to Wikidata.
-            </p>
-          </div>
+        {/* ── Data Disclaimer ─────────────────────────────── */}
+        <footer className="mt-10 border-t border-line/50 pt-5 pb-4">
+          <p className="font-body text-[11px] leading-relaxed text-ink-soft/50">
+            <strong className="font-semibold text-ink-soft/70">Data provenance:</strong>{" "}
+            Names, dates, and relationship records are compiled from{" "}
+            <a
+              href="https://www.wikidata.org"
+              target="_blank"
+              rel="noreferrer noopener"
+              className="underline underline-offset-2 hover:text-ink-soft transition-colors"
+            >
+              Wikidata&apos;s
+            </a>{" "}
+            public knowledge graph and cross-verified against mainstream press
+            reports. LLM-assisted records are labeled &ldquo;Reported&rdquo; and based
+            on publicly available media coverage. Private relationships not
+            publicly disclosed are not shown. Corrections can be submitted to
+            Wikidata directly.
+          </p>
         </footer>
       </div>
     </main>

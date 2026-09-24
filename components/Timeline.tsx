@@ -200,7 +200,7 @@ function TimelineRow({
   index: number;
   overlapping: boolean;
 }) {
-  const years = durationInYears(rel.start, rel.end);
+  const years = durationInYears(rel.start, rel.end, rel.ongoing);
   const barPercent = Math.min((years / MAX_BAR_YEARS) * 100, 100);
   const startYear = formatYear(rel.start) ?? "—";
   const isReported = rel.confidence === "reported";
@@ -326,7 +326,7 @@ function TimelineRow({
           {/* Time range & duration */}
           <div className="mt-1.5 flex flex-wrap items-center gap-x-2 text-[11px] text-ink-soft sm:text-xs">
             <span className="font-body font-medium text-ink/80">
-              {formatDuration(rel.start, rel.end)}
+              {formatDuration(rel.start, rel.end, rel.ongoing)}
             </span>
           </div>
 

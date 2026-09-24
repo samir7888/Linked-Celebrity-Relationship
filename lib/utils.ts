@@ -30,22 +30,36 @@ export function formatYear(iso?: string | null): string | null {
   return match[1];
 }
 
-export function formatDuration(startIso?: string | null, endIso?: string | null): string {
+export function formatDuration(
+  startIso?: string | null,
+  endIso?: string | null,
+  ongoing?: boolean
+): string {
   const startYear = formatYear(startIso);
   if (!startYear) return "Date unknown";
   const start = parseInt(startYear, 10);
   const endYear = formatYear(endIso);
-  if (!endYear) return `${start} — present`;
+  if (!endYear) {
+    if (ongoing) return `${start} — present`;
+    return `${start}`;
+  }
   const end = parseInt(endYear, 10);
   const years = end - start;
   if (years <= 0) return `${start}`;
   return `${start} — ${end} · ${years} ${years === 1 ? "year" : "years"}`;
 }
 
-export function durationInYears(startIso?: string | null, endIso?: string | null): number {
+export function durationInYears(
+  startIso?: string | null,
+  endIso?: string | null,
+  ongoing?: boolean
+): number {
   const startYear = formatYear(startIso);
   if (!startYear) return 0;
   const start = parseInt(startYear, 10);
+  if (!endIso && !ongoing) {
+    return 1;
+  }
   const endYear = formatYear(endIso) ?? String(new Date().getFullYear());
   const end = parseInt(endYear, 10);
   return Math.max(end - start, 0.5);

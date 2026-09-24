@@ -5,18 +5,31 @@ function rangesOverlap(a: RelationshipEdge, b: RelationshipEdge): boolean {
   const aStart = formatYear(a.start);
   const bStart = formatYear(b.start);
   if (!aStart || !bStart) return false;
-  const aEnd = formatYear(a.end) ?? String(new Date().getFullYear());
-  const bEnd = formatYear(b.end) ?? String(new Date().getFullYear());
-  return parseInt(aStart) < parseInt(bEnd) && parseInt(bStart) < parseInt(aEnd);
+
+  const currentYear = String(new Date().getFullYear());
+  // If not ongoing and end is missing, assume it ended around start year + 1
+  const aEnd =
+    formatYear(a.end) ??
+    (a.ongoing ? currentYear : String(parseInt(aStart, 10) + 1));
+  const bEnd =
+    formatYear(b.end) ??
+    (b.ongoing ? currentYear : String(parseInt(bStart, 10) + 1));
+
+  return (
+    parseInt(aStart, 10) < parseInt(bEnd, 10) &&
+    parseInt(bStart, 10) < parseInt(aEnd, 10)
+  );
 }
 
-export function computeStats(relationships: RelationshipEdge[]): RelationshipStats {
+export function computeStats(
+  relationships: RelationshipEdge[]
+): RelationshipStats {
   let longest: RelationshipEdge | null = null;
   let longestYears = -1;
   let totalYearsTracked = 0;
 
   for (const rel of relationships) {
-    const years = durationInYears(rel.start, rel.end);
+    const years = durationInYears(rel.start, rel.end, rel.ongoing);
     totalYearsTracked += years;
     if (years > longestYears) {
       longestYears = years;
